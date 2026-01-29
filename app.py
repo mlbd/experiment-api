@@ -262,6 +262,53 @@ def sharpen_rgb_keep_alpha(img_rgba: Image.Image, amount=1.10, radius=1.2, thres
     out = np.concatenate([sharp, a], axis=2)
     return Image.fromarray(out, "RGBA")
 
+def remove_inner_bg_holes(alpha_u8: np.ndarray, cand_bg: np.ndarray, max_area_ratio=0.02):
+    """
+    Remove background-like regions that are NOT border-connected (holes inside letters).
+    alpha_u8: current alpha mask (0..255)
+    cand_bg: boolean mask of "looks like bg" pixels (same as cand)
+    max_area_ratio: don't remove huge areas (protects real fills/highlights)
+    """
+    h, w = alpha_u8.shape[:2]
+    hole = cand_bg & (alpha_u8 > 0)  # bg-like pixels that still remain
+
+    if not np.any(hole):
+        return alpha_u8
+
+    num, labels = cv2.connectedComponents(hole.astype(np.uint8), connectivity=8)
+    if num <= 1:
+        return alpha_u8
+
+    max_area = int(h * w * max_area_ratio)
+    out = alpha_u8.copy()
+
+    # ring check: must be surrounded by opaque pixels (typical letter holes)
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    for lab in range(1, num):
+        comp = (labels == lab)
+        area = int(comp.sum())
+        if area == 0:
+            continue
+
+        # protect big areas (likely real design fill or background chunk)
+        if area > max_area:
+            continue
+
+        # compute boundary ring and see if it's surrounded by opaque pixels
+        dil = cv2.dilate(comp.astype(np.uint8), k, iterations=1).astype(bool)
+        ring = dil & (~comp)
+
+        if not np.any(ring):
+            continue
+
+        # surrounded if most ring pixels are opaque
+        surround_ratio = float(np.mean(out[ring] > 220))
+        if surround_ratio >= 0.60:
+            out[comp] = 0  # make hole transparent
+
+    return out
+
 
 def soften_alpha_edge(img_rgba: Image.Image, radius_px: int = 1):
     """
@@ -510,6 +557,8 @@ def remove_bg_color_method_v3(img: Image.Image, bg_color=None, tolerance=16):
 
     alpha = np.full((h, w), 255, dtype=np.uint8)
     alpha[bg_mask] = 0
+    # NEW: remove interior holes inside letters (bg-like but not border-connected)
+    alpha = remove_inner_bg_holes(alpha, cand, max_area_ratio=0.02)
 
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     bg_dil = cv2.dilate(bg_mask.astype(np.uint8), k, iterations=1).astype(bool)
