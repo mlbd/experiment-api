@@ -309,6 +309,7 @@ def remove_inner_bg_holes(alpha_u8: np.ndarray, cand_bg: np.ndarray, max_area_ra
 
     return out
 
+
 def cleanup_edge_spill(img_rgba: Image.Image, bg_rgb=(255, 255, 255), band_px=2, dist_thresh=26, gamma=1.6):
     """
     Removes background-colored residue only near the transparency edge (safe).
