@@ -12,14 +12,14 @@ from io import BytesIO
 import cv2
 import requests
 
-# Optional (but in your requirements): rembg
+# Optional (but likely in your requirements): rembg
 try:
     from rembg import new_session, remove as rembg_remove
 except Exception:
     new_session = None
     rembg_remove = None
 
-# Optional: package listing
+# Optional: installed packages listing
 try:
     import importlib.metadata as importlib_metadata
 except Exception:
@@ -38,7 +38,7 @@ MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE_MB", 10)) * 1024 * 1024
 DEBUG = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
 app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE
 
-REMBG_MODEL = os.environ.get("REMBG_MODEL", "isnet-general-use")  # good for logos
+REMBG_MODEL = os.environ.get("REMBG_MODEL", "isnet-general-use")
 REMBG_SESSION = None
 
 
@@ -55,7 +55,7 @@ def verify_api_key():
 
 
 def _enforce_only_image_field():
-    """Reject requests that include unexpected file fields (helps n8n / form-data mistakes)."""
+    """Reject requests that include unexpected file fields (helps form-data mistakes)."""
     if not request.files:
         return jsonify({"error": "No files provided"}), 400
     allowed = {"image"}
@@ -74,7 +74,7 @@ def _enforce_only_image_field():
 # -----------------------------
 def _open_image_bytes(img_bytes: bytes) -> Image.Image:
     img = Image.open(BytesIO(img_bytes))
-    # Normalize orientation if EXIF is present (best-effort)
+    # Normalize orientation (best-effort)
     try:
         exif = getattr(img, "getexif", None)
         if exif:
@@ -108,7 +108,6 @@ def has_transparency(img_bytes: bytes) -> bool:
 
 
 def _img_bytes_has_transparency(img_bytes: bytes) -> bool:
-    # Back-compat name (your older code used this)
     return has_transparency(img_bytes)
 
 
@@ -125,7 +124,7 @@ def health():
     if importlib_metadata is not None:
         try:
             for d in importlib_metadata.distributions():
-                name = d.metadata.get("Name") or d.metadata.get("Summary") or "unknown"
+                name = d.metadata.get("Name") or "unknown"
                 version = d.version or "unknown"
                 packages.append({"name": name, "version": version})
             packages.sort(key=lambda x: (x["name"] or "").lower())
@@ -236,12 +235,9 @@ def enhance_image_fal(image_bytes: bytes, wait_timeout=120, poll_interval=1.5):
 
 
 # -----------------------------
-# BG REMOVAL ANALYSIS (auto decision)
+# ANALYSIS (auto decision)
 # -----------------------------
 def analyze_image_for_bg_removal(img: Image.Image):
-    """
-    Analyze image characteristics to decide best removal strategy.
-    """
     img_rgb = img.convert("RGB")
     data = np.array(img_rgb)
     h, w = data.shape[:2]
@@ -255,21 +251,17 @@ def analyze_image_for_bg_removal(img: Image.Image):
         "edge_sharpness": 0.0,
     }
 
-    # Sample border patches
-    corner_size = max(6, min(40, h // 15, w // 15))
-    corners = [
-        data[0:corner_size, 0:corner_size],
-        data[0:corner_size, w - corner_size:w],
-        data[h - corner_size:h, 0:corner_size],
-        data[h - corner_size:h, w - corner_size:w],
+    cs = max(6, min(40, h // 15, w // 15))
+    border_samples = [
+        data[0:cs, 0:cs],
+        data[0:cs, w - cs:w],
+        data[h - cs:h, 0:cs],
+        data[h - cs:h, w - cs:w],
+        data[0:cs, w // 2 - cs // 2:w // 2 + cs // 2],
+        data[h - cs:h, w // 2 - cs // 2:w // 2 + cs // 2],
+        data[h // 2 - cs // 2:h // 2 + cs // 2, 0:cs],
+        data[h // 2 - cs // 2:h // 2 + cs // 2, w - cs:w],
     ]
-    edge_samples = [
-        data[0:corner_size, w // 2 - corner_size // 2:w // 2 + corner_size // 2],
-        data[h - corner_size:h, w // 2 - corner_size // 2:w // 2 + corner_size // 2],
-        data[h // 2 - corner_size // 2:h // 2 + corner_size // 2, 0:corner_size],
-        data[h // 2 - corner_size // 2:h // 2 + corner_size // 2, w - corner_size:w],
-    ]
-    border_samples = corners + edge_samples
 
     means = []
     stds = []
@@ -281,7 +273,6 @@ def analyze_image_for_bg_removal(img: Image.Image):
     means = np.array(means, dtype=np.float32)
     stds = np.array(stds, dtype=np.float32)
 
-    # If border regions are similar and low variance => solid bg likely
     mean_dist = float(np.mean(np.linalg.norm(means - np.mean(means, axis=0), axis=1)))
     std_mean = float(np.mean(stds))
 
@@ -290,25 +281,21 @@ def analyze_image_for_bg_removal(img: Image.Image):
         bg = np.median(means, axis=0)
         analysis["bg_color"] = tuple(int(x) for x in bg)
 
-        # Estimate bg coverage with a tolerant threshold (compression noise-safe)
         bg_rgb = np.array(bg, dtype=np.float32)[None, None, :]
         dist = np.linalg.norm(data.astype(np.float32) - bg_rgb, axis=2)
         analysis["bg_coverage"] = float(np.mean(dist < max(18.0, std_mean * 1.3)))
 
-    # Color complexity (downsample + unique count)
     small = cv2.resize(data, (max(32, w // 10), max(32, h // 10)), interpolation=cv2.INTER_AREA)
     pixels = small.reshape(-1, 3)
     unique_colors = len(np.unique(pixels, axis=0))
-    analysis["color_complexity"] = float(unique_colors / pixels.shape[0])
+    analysis["color_complexity"] = float(unique_colors / max(1, pixels.shape[0]))
 
-    # Edge sharpness (Sobel magnitude)
     gray = cv2.cvtColor(data, cv2.COLOR_RGB2GRAY)
     sx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     sy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
     mag = cv2.magnitude(sx, sy)
     analysis["edge_sharpness"] = float(np.mean(mag))
 
-    # Heuristic: graphic/logo tends to be low complexity + sharper edges + often solid bg
     analysis["is_graphic"] = bool(
         (analysis["color_complexity"] < 0.35 and analysis["edge_sharpness"] > 20)
         or (analysis["has_solid_bg"] and analysis["color_complexity"] < 0.45)
@@ -318,7 +305,7 @@ def analyze_image_for_bg_removal(img: Image.Image):
 
 
 # -----------------------------
-# EDGE HELPERS (trim + defringe)
+# TRIM
 # -----------------------------
 def trim_transparent(img: Image.Image, padding: int = 2) -> Image.Image:
     img = img.convert("RGBA")
@@ -335,50 +322,37 @@ def trim_transparent(img: Image.Image, padding: int = 2) -> Image.Image:
     return img.crop((x0, y0, x1 + 1, y1 + 1))
 
 
-def _defringe_rgba(data_rgba: np.ndarray, radius: int = 2) -> np.ndarray:
+# -----------------------------
+# EDGE FEATHER + DECONTAMINATION (NO "bleeding" defringe)
+# -----------------------------
+def _decontaminate_edges(img_rgba: Image.Image, bg_rgb_u8):
     """
-    Remove "white/black halo" by replacing semi-transparent RGB with nearest opaque neighbor RGB.
+    Unmix RGB from background on semi-transparent edge pixels:
+      observed = fg*a + bg*(1-a)  ->  fg = (observed - bg*(1-a)) / a
+    This removes halos WITHOUT dilating/painting new pixels.
     """
-    if radius <= 0:
-        return data_rgba
+    bg = np.array(bg_rgb_u8, dtype=np.float32).reshape(1, 1, 3)
 
-    rgb = data_rgba[:, :, :3].copy()
-    alpha = data_rgba[:, :, 3].copy()
+    data = np.array(img_rgba.convert("RGBA"), dtype=np.float32)
+    rgb = data[:, :, :3]
+    a = data[:, :, 3:4] / 255.0
 
-    opaque = (alpha >= 240).astype(np.uint8) * 255
-    if opaque.sum() == 0:
-        return data_rgba
+    mask = (a > 0.0) & (a < 1.0)
+    rgb_unmixed = (rgb - (1.0 - a) * bg) / np.clip(a, 1e-3, 1.0)
+    rgb_unmixed = np.clip(rgb_unmixed, 0, 255)
 
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
-    # Expand opaque area outward to borrow colors
-    opaque_dil = cv2.dilate(opaque, k, iterations=1)
+    rgb = np.where(mask, rgb_unmixed, rgb)
+    rgb = np.where(a == 0.0, 0.0, rgb)  # clean fully-transparent RGB
 
-    # For each channel, dilate using mask of opaque pixels
-    # We approximate "nearest opaque" by a few dilations
-    borrowed = rgb.copy()
-    for _ in range(radius):
-        borrowed = cv2.dilate(borrowed, k, iterations=1)
-
-    semi = (alpha > 0) & (alpha < 255)
-    # Only replace where we're near an opaque region (avoid painting fully transparent areas)
-    near_opaque = (opaque_dil > 0) & semi
-    rgb[near_opaque] = borrowed[near_opaque]
-
-    out = data_rgba.copy()
-    out[:, :, :3] = rgb
-    out[:, :, 3] = alpha
-    return out
+    data[:, :, :3] = rgb
+    return Image.fromarray(data.astype(np.uint8), "RGBA")
 
 
-def refine_edges(img: Image.Image, feather_amount: int = 2, defringe_radius: int = 2) -> Image.Image:
-    """
-    Light feather + defringe for cleaner logo edges after background removal.
-    """
+def refine_edges(img: Image.Image, feather_amount: int = 2) -> Image.Image:
     img = img.convert("RGBA")
     data = np.array(img, dtype=np.uint8)
     alpha = data[:, :, 3].astype(np.uint8)
 
-    # Feather only near edge pixels (where alpha is not fully opaque/transparent)
     edge_mask = (alpha > 0) & (alpha < 255)
     if edge_mask.any() and feather_amount > 0:
         k = feather_amount * 2 + 1
@@ -386,114 +360,162 @@ def refine_edges(img: Image.Image, feather_amount: int = 2, defringe_radius: int
         alpha[edge_mask] = blurred[edge_mask]
         data[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
 
-    if defringe_radius > 0:
-        data = _defringe_rgba(data, radius=defringe_radius)
-
     return Image.fromarray(data, "RGBA")
 
 
 # -----------------------------
-# BG REMOVAL: COLOR (solid bg) - UPGRADED
+# BG COLOR ESTIMATION: BORDER MODE (safer than median)
 # -----------------------------
-def _estimate_bg_from_border_rgb(img_rgb: np.ndarray):
-    h, w = img_rgb.shape[:2]
-    b = max(2, min(20, h // 40, w // 40))  # border thickness
-    top = img_rgb[0:b, :, :]
-    bottom = img_rgb[h - b:h, :, :]
-    left = img_rgb[:, 0:b, :]
-    right = img_rgb[:, w - b:w, :]
-    border = np.concatenate([top.reshape(-1, 3), bottom.reshape(-1, 3), left.reshape(-1, 3), right.reshape(-1, 3)], axis=0)
-    bg_rgb = np.median(border, axis=0).astype(np.float32)
-    bg_std = float(np.mean(np.std(border.astype(np.float32), axis=0)))
-    return bg_rgb, bg_std, b
+def _estimate_bg_color_border_mode(rgb_u8: np.ndarray, border_px: int):
+    h, w = rgb_u8.shape[:2]
+    b = int(max(2, min(border_px, h // 4, w // 4)))
+
+    top = rgb_u8[0:b, :, :].reshape(-1, 3)
+    bottom = rgb_u8[h - b:h, :, :].reshape(-1, 3)
+    left = rgb_u8[:, 0:b, :].reshape(-1, 3)
+    right = rgb_u8[:, w - b:w, :].reshape(-1, 3)
+
+    border = np.concatenate([top, bottom, left, right], axis=0)
+
+    # quantize to reduce noise; compute mode
+    q = (border // 16).astype(np.int16)  # 0..15
+    keys = (q[:, 0] << 8) | (q[:, 1] << 4) | q[:, 2]
+    vals, counts = np.unique(keys, return_counts=True)
+    mode_key = int(vals[np.argmax(counts)])
+
+    r = (mode_key >> 8) & 0xFF
+    g = (mode_key >> 4) & 0x0F
+    bq = mode_key & 0x0F
+
+    # convert back to 0..255 (center of bin)
+    bg = np.array([r, g, bq], dtype=np.float32)
+    bg = bg * 16.0 + 8.0
+    return bg.astype(np.uint8)
 
 
-def remove_bg_color_method_v2(img: Image.Image, bg_color=None, tolerance=None):
+# -----------------------------
+# BG REMOVAL: COLOR (solid bg) - V3 (black/white safe)
+# -----------------------------
+def _lab_dist(rgb_u8: np.ndarray, bg_rgb_u8: np.ndarray):
+    lab = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2LAB).astype(np.int16)
+    bg_lab = cv2.cvtColor(bg_rgb_u8.reshape(1, 1, 3), cv2.COLOR_RGB2LAB)[0, 0].astype(np.int16)
+    d = lab - bg_lab[None, None, :]
+    dist = np.sqrt((d[:, :, 0] ** 2) + (d[:, :, 1] ** 2) + (d[:, :, 2] ** 2)).astype(np.float32)
+    return lab, dist
+
+
+def remove_bg_color_method_v3(img: Image.Image, bg_color=None, tolerance=16):
     """
-    Robust solid-bg removal:
-    - Works better on compressed JPEG logos (border noise)
-    - Uses LAB distance + connected-components from border
-    - Soft edge alpha + defringe to reduce halo
-    Returns: (result_img, meta)
+    Solid-bg removal that won't eat dark colored strokes on black backgrounds.
+
+    - bg estimated via BORDER MODE (quantized) unless provided
+    - if bg is near-black or near-white: use LAB chroma guard
+    - background is ONLY border-connected (connected components)
+    - creates soft alpha edge
+    - decontaminates halos using bg color
     """
-    img = img.convert("RGBA")
-    rgba = np.array(img, dtype=np.uint8)
+    pil = img.convert("RGBA")
+    rgba = np.array(pil, dtype=np.uint8)
     rgb = rgba[:, :, :3]
     h, w = rgb.shape[:2]
 
-    bg_rgb, bg_std, border_thickness = _estimate_bg_from_border_rgb(rgb)
-    if bg_color is not None:
-        bg_rgb = np.array(bg_color, dtype=np.float32)
+    border_px = max(6, min(24, h // 15, w // 15))
 
-    # Adaptive tolerance (handles noisy JPG backgrounds)
-    if tolerance is None:
-        # base + noise factor, clamped
-        tolerance = int(np.clip(18 + bg_std * 1.6, 18, 48))
+    if bg_color is None:
+        bg_rgb = _estimate_bg_color_border_mode(rgb, border_px)
+    else:
+        bg_rgb = np.array(bg_color, dtype=np.uint8)
 
-    # LAB distance (more perceptual)
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.int16)
-    bg_lab = cv2.cvtColor(np.uint8([[bg_rgb]]), cv2.COLOR_RGB2LAB)[0, 0].astype(np.int16)
-    d = lab - bg_lab[None, None, :]
-    dist = np.sqrt((d[:, :, 0] ** 2) + (d[:, :, 1] ** 2) + (d[:, :, 2] ** 2)).astype(np.float32)
+    # Cap tolerance for logos (prevents "eating" dark strokes)
+    tol = int(np.clip(tolerance, 8, 26))
 
-    # Candidate background by distance threshold
-    cand = (dist <= float(tolerance)).astype(np.uint8)
+    lab, dist = _lab_dist(rgb, bg_rgb.astype(np.uint8))
 
-    # Connected components: keep components that touch border as "background"
-    num, labels = cv2.connectedComponents(cand, connectivity=8)
+    L = lab[:, :, 0].astype(np.int16)
+    a = lab[:, :, 1].astype(np.int16) - 128
+    b = lab[:, :, 2].astype(np.int16) - 128
+    chroma = np.sqrt((a.astype(np.float32) ** 2) + (b.astype(np.float32) ** 2))
+
+    # Detect near-black / near-white bg
+    bg_sum = int(bg_rgb[0]) + int(bg_rgb[1]) + int(bg_rgb[2])
+    near_black = bg_sum <= 60
+    near_white = bg_sum >= (255 * 3 - 60)
+
+    if near_black:
+        # Background black tends to have low L and low chroma
+        cand = (L <= 55) & (chroma <= 16.0)
+    elif near_white:
+        # Background white tends to have high L and low chroma
+        cand = (L >= 200) & (chroma <= 18.0)
+    else:
+        cand = dist <= float(tol)
+
+    cand_u8 = cand.astype(np.uint8)
+
+    # Connected components, keep labels that touch the border as background
+    num, labels = cv2.connectedComponents(cand_u8, connectivity=8)
     if num <= 1:
-        # fallback: nothing detected
-        out = img.copy()
-        meta = {"bg_rgb": tuple(int(x) for x in bg_rgb), "tolerance": tolerance, "reason": "no_components"}
+        # no background detected
+        out = pil.copy()
+        meta = {"bg_rgb": tuple(int(x) for x in bg_rgb), "tolerance": tol, "reason": "no_components"}
         return out, meta
 
-    border_labels = set()
-    # collect labels touching border
     border = np.zeros((h, w), dtype=bool)
-    border[0:border_thickness, :] = True
-    border[h - border_thickness:h, :] = True
-    border[:, 0:border_thickness] = True
-    border[:, w - border_thickness:w] = True
+    b = border_px
+    border[0:b, :] = True
+    border[h - b:h, :] = True
+    border[:, 0:b] = True
+    border[:, w - b:w] = True
 
-    border_touch = labels[border]
-    for v in np.unique(border_touch):
-        if v != 0:
-            border_labels.add(int(v))
+    border_labels = np.unique(labels[border])
+    border_labels = border_labels[border_labels != 0]
 
-    bg_mask = np.isin(labels, list(border_labels))
+    bg_mask = np.isin(labels, border_labels)
 
-    # Build alpha: background => 0
+    # Alpha: background -> 0
     alpha = np.full((h, w), 255, dtype=np.uint8)
     alpha[bg_mask] = 0
 
-    # Soft edges (anti-alias): only near background boundary
+    # Soft edge only near boundary
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    bg_dil = cv2.dilate(bg_mask.astype(np.uint8) * 255, k, iterations=1) > 0
+    bg_dil = cv2.dilate(bg_mask.astype(np.uint8), k, iterations=1).astype(bool)
     edge_zone = bg_dil & (~bg_mask)
 
-    feather = max(8.0, float(tolerance) * 0.8)
-    soft = edge_zone & (dist < (float(tolerance) + feather))
-
-    # When dist == tolerance => alpha 0; when dist == tolerance+feather => alpha 255
-    a_soft = ((dist[soft] - float(tolerance)) / feather) * 255.0
-    alpha[soft] = np.clip(a_soft, 0, 255).astype(np.uint8)
+    # For non-black/white we can use distance to soften; for black/white use chroma/L to soften
+    feather = 12.0
+    if not (near_black or near_white):
+        soft = edge_zone & (dist < (float(tol) + feather))
+        a_soft = ((dist[soft] - float(tol)) / feather) * 255.0
+        alpha[soft] = np.clip(a_soft, 0, 255).astype(np.uint8)
+    else:
+        # soften based on L/chroma instead of dist
+        if near_black:
+            soft = edge_zone & (L < 80)
+            a_soft = ((L[soft].astype(np.float32) - 55.0) / 25.0) * 255.0
+        else:
+            soft = edge_zone & (L > 175)
+            a_soft = ((200.0 - L[soft].astype(np.float32)) / 25.0) * 255.0
+        alpha[soft] = np.clip(a_soft, 0, 255).astype(np.uint8)
 
     out = rgba.copy()
     out[:, :, 3] = alpha
+    out_img = Image.fromarray(out, "RGBA")
 
-    # Defringe to avoid white/black halo
-    out = _defringe_rgba(out, radius=2)
+    # Decontaminate halos
+    out_img = _decontaminate_edges(out_img, bg_rgb)
 
     meta = {
         "bg_rgb": tuple(int(x) for x in bg_rgb),
-        "tolerance": int(tolerance),
+        "tolerance": tol,
+        "near_black": bool(near_black),
+        "near_white": bool(near_white),
         "bg_removed_ratio": float(np.mean(alpha == 0)),
     }
-    return Image.fromarray(out, "RGBA"), meta
+    return out_img, meta
 
 
 # -----------------------------
-# BG REMOVAL: AI (rembg) - stronger defaults
+# BG REMOVAL: AI (rembg)
 # -----------------------------
 def _get_rembg_session():
     global REMBG_SESSION
@@ -503,26 +525,15 @@ def _get_rembg_session():
 
 
 def remove_bg_ai_method(img: Image.Image, is_graphic: bool):
-    """
-    Rembg-based removal:
-    - For graphics/logos: keep crisp edges (no alpha matting)
-    - For photos: enable alpha matting
-    """
     if rembg_remove is None or new_session is None:
-        # If rembg not available, just return original
         return img.convert("RGBA"), {"reason": "rembg_unavailable"}
 
     session = _get_rembg_session()
-
     pil_in = img.convert("RGBA")
 
     try:
         if is_graphic:
-            out = rembg_remove(
-                pil_in,
-                session=session,
-                post_process_mask=True,
-            )
+            out = rembg_remove(pil_in, session=session, post_process_mask=True)
         else:
             out = rembg_remove(
                 pil_in,
@@ -533,7 +544,6 @@ def remove_bg_ai_method(img: Image.Image, is_graphic: bool):
                 alpha_matting_background_threshold=10,
                 alpha_matting_erode_size=12,
             )
-
         out = out.convert("RGBA")
         return out, {"reason": "rembg_ok"}
 
@@ -542,7 +552,7 @@ def remove_bg_ai_method(img: Image.Image, is_graphic: bool):
 
 
 # -----------------------------
-# BG REMOVAL: AUTO (decision + validation)
+# AUTO SCORING (stable selection)
 # -----------------------------
 def _corners_transparent_ratio(img_rgba: Image.Image) -> float:
     data = np.array(img_rgba.convert("RGBA"), dtype=np.uint8)
@@ -560,51 +570,88 @@ def _corners_transparent_ratio(img_rgba: Image.Image) -> float:
     return float(trans / max(1, total))
 
 
-def remove_bg_auto_v2(img: Image.Image, analysis: dict):
+def _score_result(img_rgba: Image.Image):
     """
-    Auto strategy:
-    1) If solid bg likely -> try COLOR first
-    2) Validate: corners must become transparent enough; otherwise fallback to AI
+    Higher is better:
+    - wants corners transparent
+    - wants some content kept
+    - avoids "almost everything removed" or "nothing removed"
     """
-    method_used = "color_v2"
-    fallback_used = False
+    data = np.array(img_rgba.convert("RGBA"), dtype=np.uint8)
+    a = data[:, :, 3]
+    content = float(np.mean(a > 20))
+    corner_t = _corners_transparent_ratio(img_rgba)
 
-    # Prefer color if border says solid bg (common for logos)
-    if analysis.get("has_solid_bg", False):
-        out, meta = remove_bg_color_method_v2(img, bg_color=analysis.get("bg_color"))
-        out = out.convert("RGBA")
+    # Penalize extreme content ratios
+    penalty = 0.0
+    if content < 0.02:
+        penalty += (0.02 - content) * 4.0
+    if content > 0.98:
+        penalty += (content - 0.98) * 3.0
 
-        # Validate: corners should be mostly transparent
-        corner_t = _corners_transparent_ratio(out)
-        removed_ratio = float(np.mean(np.array(out.getchannel("A")) == 0))
+    return (corner_t * 2.5) + (content * 0.5) - penalty
 
-        # If it barely removed anything OR corners still opaque -> fail
-        if corner_t < 0.75 or removed_ratio < 0.10:
-            fallback_used = True
-            method_used = "ai_rembg_fallback"
-            out, _ = remove_bg_ai_method(img, is_graphic=analysis.get("is_graphic", False))
 
-        return out.convert("RGBA"), method_used, fallback_used
+def remove_bg_auto_v3(img: Image.Image, analysis: dict):
+    """
+    Stable AUTO:
+    - for logos/solid bg: try color method at several tolerances, pick best
+    - fallback to AI only if corner transparency fails badly
+    """
+    is_graphic = bool(analysis.get("is_graphic", False))
+    has_solid = bool(analysis.get("has_solid_bg", False))
 
-    # If not solid bg, go AI first
-    method_used = "ai_rembg"
-    out, _ = remove_bg_ai_method(img, is_graphic=analysis.get("is_graphic", False))
-    return out.convert("RGBA"), method_used, fallback_used
+    # Prefer color for logos/solid backgrounds
+    if is_graphic or has_solid:
+        best = None
+        best_meta = None
+        best_score = -1e9
+
+        # tolerant list (kept low to prevent eating dark strokes)
+        for tol in (10, 12, 14, 16, 18, 20, 22, 24, 26):
+            out, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=tol)
+
+            # basic sanity: must remove at least a little
+            removed_ratio = meta.get("bg_removed_ratio", 0.0)
+            if removed_ratio < 0.05:
+                continue
+
+            sc = _score_result(out)
+            if sc > best_score:
+                best = out
+                best_meta = meta
+                best_score = sc
+
+        if best is None:
+            best, best_meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
+
+        corner_t = _corners_transparent_ratio(best)
+        if corner_t < 0.70:
+            # fallback to AI (rare for real logos, but helps complex bgs)
+            ai, ai_meta = remove_bg_ai_method(img, is_graphic=is_graphic)
+            return ai, "ai_rembg_fallback", True, {"picked": "ai", "ai_meta": ai_meta, "color_meta": best_meta}
+
+        return best, "color_v3_auto_pick", False, {"picked": "color", "color_meta": best_meta, "score": best_score}
+
+    # Otherwise AI first
+    ai, ai_meta = remove_bg_ai_method(img, is_graphic=is_graphic)
+    return ai, "ai_rembg_auto", False, {"picked": "ai", "ai_meta": ai_meta}
 
 
 # -----------------------------
-# /remove-bg (ONLY endpoint kept)
+# /remove-bg (ONLY endpoint)
 # -----------------------------
 @app.route("/remove-bg", methods=["POST"])
 def remove_bg_endpoint():
     """
-    Only accepts: multipart/form-data with field "image"
+    multipart/form-data:
+      - image: file (required)
 
-    Optional fields:
-      - enhance: true/false (default=false)
-      - trim: true/false (default=true)
-      - output_format: png/webp (default=png)
-      - bg_remove: auto/ai/color/skip (default=auto)
+    optional:
+      - enhance: true/false (default false)
+      - trim: true/false (default true)
+      - output_format: png/webp (default png)
+      - bg_remove: auto/ai/color/skip (default auto)
     """
     start_time = time.time()
     processing_log = []
@@ -634,15 +681,15 @@ def remove_bg_endpoint():
         return attach_logs_to_response(resp)
 
     # auth
-    log("auth_check", success=True)
     auth_error = verify_api_key()
     if auth_error:
         resp, status = auth_error
         resp.status_code = status
         log("auth_check", success=False, reason="invalid_or_missing_api_key")
         return attach_logs_to_response(resp)
+    log("auth_check", success=True)
 
-    # enforce image-only field
+    # enforce image-only
     enforce_error = _enforce_only_image_field()
     if enforce_error:
         resp, status = enforce_error
@@ -659,7 +706,6 @@ def remove_bg_endpoint():
 
         log("read_image", success=True, bytes=len(img_bytes), filename=getattr(file, "filename", ""))
 
-        # params
         do_enhance = request.form.get("enhance", "false").lower() == "true"
         do_trim = request.form.get("trim", "true").lower() == "true"
         output_format = request.form.get("output_format", "png").strip().lower()
@@ -672,7 +718,7 @@ def remove_bg_endpoint():
 
         log("read_params", success=True, enhance=do_enhance, trim=do_trim, output_format=output_format, bg_remove=bg_remove)
 
-        # If already transparent, skip removal immediately
+        # already transparent?
         try:
             already_transparent = has_transparency(img_bytes)
             log("check_transparency", success=True, already_transparent=already_transparent)
@@ -680,7 +726,7 @@ def remove_bg_endpoint():
             already_transparent = False
             log("check_transparency", success=False, error=str(e), already_transparent=False)
 
-        # Optional enhance (fal) BEFORE bg removal
+        # optional enhance (can be nondeterministic)
         enhanced = False
         enhance_msg = "not requested"
         if do_enhance:
@@ -689,45 +735,40 @@ def remove_bg_endpoint():
                 img_bytes = enhanced_bytes
             log("enhance_fal", success=True, applied=bool(enhanced), message=str(enhance_msg))
 
-        # decode image
+        # decode
         img = _open_image_bytes(img_bytes)
         log("decode_image", success=True, mode=img.mode, size=f"{img.width}x{img.height}")
 
-        # analysis
         analysis = analyze_image_for_bg_removal(img)
         log("analyze", success=True, **analysis)
 
-        # bg removal
         method_used = "skip"
         fallback_used = False
+        meta = {}
 
         if already_transparent:
             result_img = img.convert("RGBA")
             method_used = "skip_already_transparent"
-
         else:
             if bg_remove == "skip":
                 result_img = img.convert("RGBA")
                 method_used = "skip_requested"
 
             elif bg_remove == "color":
-                result_img, meta = remove_bg_color_method_v2(img, bg_color=analysis.get("bg_color"))
-                method_used = "color_v2_forced"
-                log("bg_remove_color_v2", success=True, **meta)
+                result_img, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
+                method_used = "color_v3_forced"
 
             elif bg_remove == "ai":
                 result_img, meta = remove_bg_ai_method(img, is_graphic=analysis.get("is_graphic", False))
                 method_used = "ai_rembg_forced"
-                log("bg_remove_ai", success=True, **meta)
 
             else:
-                # auto
-                result_img, method_used, fallback_used = remove_bg_auto_v2(img, analysis)
+                result_img, method_used, fallback_used, meta = remove_bg_auto_v3(img, analysis)
 
-        log("bg_removed", success=True, method_used=method_used, fallback_used=fallback_used)
+        log("bg_removed", success=True, method_used=method_used, fallback_used=fallback_used, meta=meta)
 
-        # edge refine
-        result_img = refine_edges(result_img, feather_amount=2, defringe_radius=2)
+        # feather (small)
+        result_img = refine_edges(result_img, feather_amount=2)
         log("refine_edges", success=True)
 
         # trim
@@ -740,7 +781,6 @@ def remove_bg_endpoint():
         # encode
         out = BytesIO()
         if output_format == "webp":
-            # Keep alpha; use lossless for logos
             result_img.save(out, format="WEBP", lossless=True, quality=100, method=6)
             mimetype = "image/webp"
             ext = "webp"
@@ -765,14 +805,8 @@ def remove_bg_endpoint():
         resp.headers["X-Bg-Remove"] = bg_remove
         resp.headers["X-Method-Used"] = method_used
         resp.headers["X-Fallback-Used"] = str(bool(fallback_used))
-
-        resp.headers["X-Has-Solid-BG"] = str(analysis.get("has_solid_bg", False))
-        resp.headers["X-Is-Graphic"] = str(analysis.get("is_graphic", False))
-        resp.headers["X-Already-Transparent"] = str(bool(already_transparent))
-
         resp.headers["X-Enhanced"] = str(bool(enhanced))
         resp.headers["X-Enhance-Status"] = str(enhance_msg)
-
         resp.headers["X-Trimmed"] = str(bool(do_trim))
         resp.headers["X-Processing-Time"] = f"{processing_time:.2f}s"
         resp.headers["X-Output-Size"] = f"{result_img.width}x{result_img.height}"
