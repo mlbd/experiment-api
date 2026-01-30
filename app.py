@@ -1412,7 +1412,7 @@ def smart_print_ready():
 
     Params (form-data):
     - image: file (required)
-    - print_color: 'white' | 'black' (required)
+    - print_color: 'white' | 'black' ( required )
     - layers: 'auto' | 2..6 (default: 'auto')         # used for STEPPED components
     - white_step: 5..30 (default: 10)                 # used for STEPPED components
     - black_step: 15..50 (default: 33)                # used for STEPPED components
