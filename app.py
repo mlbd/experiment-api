@@ -2102,6 +2102,139 @@ def smart_print_ready():
             "traceback": traceback.format_exc()
         }), 500
 
+@app.route("/make-solid", methods=["POST"])
+def make_solid():
+    """
+    /make-solid
+    - Brute-force convert ALL non-background pixels to a single solid color (white or black).
+    - Keeps transparency (alpha) from the original image.
+    - Uses a background mask similar to /smart-print-ready (corner sampling + flood fill).
+
+    Params (form-data):
+      - image: file (required)
+      - print_color: 'white' | 'black' (required)
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+
+    try:
+        if "image" not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+
+        file = request.files["image"]
+        print_color = (request.form.get("print_color") or "").strip().lower()
+
+        if print_color not in ("white", "black"):
+            return jsonify({
+                "error": "print_color is required",
+                "allowed": ["white", "black"]
+            }), 400
+
+        img = Image.open(file.stream).convert("RGBA")
+        data = np.array(img)
+        h, w = data.shape[:2]
+
+        r = data[:, :, 0].astype(np.uint8)
+        g = data[:, :, 1].astype(np.uint8)
+        b = data[:, :, 2].astype(np.uint8)
+        a = data[:, :, 3].astype(np.uint8)
+
+        # ------------------------------------------------------------
+        # Background detection (same spirit as smart-print-ready)
+        # ------------------------------------------------------------
+        corners = [data[0, 0], data[0, w - 1], data[h - 1, 0], data[h - 1, w - 1]]
+        corner_colors = np.array([c[:3] for c in corners], dtype=np.float32)
+        corner_alphas = np.array([c[3] for c in corners], dtype=np.float32)
+
+        avg_corner = np.mean(corner_colors, axis=0)
+        avg_alpha = float(np.mean(corner_alphas))
+        corner_std = float(np.std(corner_colors))
+        corners_consistent = corner_std < 30
+
+        if avg_alpha < 128:
+            bg_type = "transparent"
+            bg_mask = a < 10
+        elif corners_consistent and float(np.mean(avg_corner)) > 240:
+            bg_type = "white"
+            bg_mask = (r > 250) & (g > 250) & (b > 250) & (a > 200)
+        elif corners_consistent and float(np.mean(avg_corner)) < 15:
+            bg_type = "black"
+            bg_mask = (r < 5) & (g < 5) & (b < 5) & (a > 200)
+        elif corners_consistent:
+            bg_type = "colored"
+            tolerance = 20
+            bg_mask = (
+                (np.abs(r.astype(np.int16) - int(avg_corner[0])) < tolerance) &
+                (np.abs(g.astype(np.int16) - int(avg_corner[1])) < tolerance) &
+                (np.abs(b.astype(np.int16) - int(avg_corner[2])) < tolerance) &
+                (a > 200)
+            )
+        else:
+            bg_type = "mixed/none"
+            bg_mask = a < 10
+
+        # Always treat near-transparent as background
+        bg_mask = bg_mask | (a < 10)
+
+        # Flood fill from corners for non-transparent backgrounds
+        if bg_type not in ["transparent", "mixed/none"]:
+            potential_bg = (bg_mask.astype(np.uint8) * 255)
+            connected_bg = np.zeros_like(potential_bg)
+
+            for sy, sx in [(0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)]:
+                if potential_bg[sy, sx] > 0:
+                    tmp = potential_bg.copy()
+                    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+                    cv2.floodFill(tmp, flood_mask, (sx, sy), 128)
+                    connected_bg[tmp == 128] = 255
+
+            bg_mask = connected_bg > 0
+
+        logo_mask = (~bg_mask) & (a > 10)
+        if int(np.sum(logo_mask)) == 0:
+            # fallback: use alpha-only if bg detection fails
+            logo_mask = a > 10
+            bg_mask = ~logo_mask
+            bg_type = "fallback-alpha-only"
+
+        # ------------------------------------------------------------
+        # Brute-force solid fill while keeping alpha
+        # ------------------------------------------------------------
+        base = 255 if print_color == "white" else 0
+
+        out = np.zeros((h, w, 4), dtype=np.uint8)
+        out[:, :, 3] = 0  # background stays transparent
+
+        out[logo_mask, 0] = base
+        out[logo_mask, 1] = base
+        out[logo_mask, 2] = base
+        out[logo_mask, 3] = a[logo_mask]  # preserve original alpha for smooth edges
+
+        out_img = Image.fromarray(out, "RGBA")
+        buf = BytesIO()
+        out_img.save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+
+        resp = send_file(
+            buf,
+            mimetype="image/png",
+            as_attachment=False,
+            download_name=f"solid_{print_color}.png"
+        )
+        resp.headers["X-Print-Color"] = print_color.upper()
+        resp.headers["X-Background-Type"] = bg_type
+        resp.headers["X-Output-Size"] = f"{out_img.width}x{out_img.height}"
+        resp.headers["X-Processing-Method"] = "solid-fill"
+        return resp
+
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "error": "Processing failed",
+            "details": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
 
 
 
