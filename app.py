@@ -245,6 +245,107 @@ def enhance_image_fal(image_bytes: bytes, wait_timeout=120, poll_interval=1.5):
     except Exception as e:
         return image_bytes, False, f"fal exception: {e}"
 
+def remove_bg_birefnet_fal(
+    image_bytes: bytes,
+    model: str = "General Use (Light)",
+    operating_resolution: str = "1024x1024",
+    output_format: str = "png",
+    refine_foreground: bool = True,
+    sync_mode: bool = False,
+    wait_timeout: int = 120,
+    poll_interval: float = 1.5,
+):
+    """
+    fal-ai/birefnet/v2 (Queue API) background removal.
+    Returns: (bytes, applied_bool, message)
+    """
+    if not FAL_KEY:
+        return image_bytes, False, "FAL_KEY not configured"
+
+    def _first(x):
+        return x[0] if isinstance(x, list) and x else x
+
+    def _decode_data_uri(data_uri: str) -> bytes:
+        try:
+            _, b64 = data_uri.split(",", 1)
+            return base64.b64decode(b64)
+        except Exception:
+            return b""
+
+    try:
+        # Build data URI
+        img_base64 = base64.b64encode(image_bytes).decode("utf-8")
+        img = _open_image_bytes(image_bytes)
+        mime_type = "image/png" if (img.format or "").upper() == "PNG" else "image/jpeg"
+        data_uri = f"data:{mime_type};base64,{img_base64}"
+
+        headers = {"Authorization": f"Key {FAL_KEY}", "Content-Type": "application/json"}
+
+        submit = requests.post(
+            "https://queue.fal.run/fal-ai/birefnet/v2",
+            headers=headers,
+            json={
+                "image_url": data_uri,
+                "model": model,
+                "operating_resolution": operating_resolution,
+                "refine_foreground": bool(refine_foreground),
+                "sync_mode": bool(sync_mode),
+                "output_format": output_format,
+            },
+            timeout=60,
+        )
+        if submit.status_code not in (200, 201, 202):
+            return image_bytes, False, f"fal submit failed: HTTP {submit.status_code} {submit.text[:200]}"
+
+        submit_json = _first(submit.json())
+        request_id = (submit_json or {}).get("request_id")
+        if not request_id:
+            return image_bytes, False, "fal submit response missing request_id"
+
+        status_url = f"https://queue.fal.run/fal-ai/birefnet/v2/requests/{request_id}/status"
+        result_url = f"https://queue.fal.run/fal-ai/birefnet/v2/requests/{request_id}"
+
+        start = time.monotonic()
+        while (time.monotonic() - start) < wait_timeout:
+            st = requests.get(status_url, headers={"Authorization": f"Key {FAL_KEY}"}, timeout=30)
+            if st.status_code not in (200, 202):
+                return image_bytes, False, f"fal status failed: HTTP {st.status_code} {st.text[:200]}"
+
+            st_json = _first(st.json()) or {}
+            status = st_json.get("status")
+
+            if status in ("COMPLETED", "SUCCEEDED"):
+                break
+            if status in ("FAILED", "CANCELED", "CANCELLED"):
+                return image_bytes, False, f"fal failed: {st_json}"
+
+            time.sleep(poll_interval)
+
+        res = requests.get(result_url, headers={"Authorization": f"Key {FAL_KEY}"}, timeout=60)
+        if res.status_code != 200:
+            return image_bytes, False, f"fal result failed: HTTP {res.status_code} {res.text[:200]}"
+
+        res_json = _first(res.json()) or {}
+        image_obj = res_json.get("image") or {}
+        out_url = image_obj.get("url") or ""
+
+        if out_url.startswith("data:"):
+            out_bytes = _decode_data_uri(out_url)
+            if out_bytes:
+                return out_bytes, True, "fal birefnet ok (data uri)"
+            return image_bytes, False, "fal returned data uri but decode failed"
+
+        if out_url.startswith("http"):
+            dl = requests.get(out_url, timeout=60)
+            if dl.status_code == 200 and dl.content:
+                return dl.content, True, "fal birefnet ok (downloaded)"
+            return image_bytes, False, f"fal output download failed: HTTP {dl.status_code}"
+
+        return image_bytes, False, "fal result missing image.url"
+
+    except Exception as e:
+        return image_bytes, False, f"fal exception: {e}"
+
 
 # -----------------------------
 # SHARPEN (RGB only) + ALPHA EDGE SOFTEN
@@ -1017,6 +1118,9 @@ def remove_bg_endpoint():
       - trim: true/false (default true)
       - output_format: png/webp (default png)
       - bg_remove: auto/ai/color/skip (default auto)
+
+      - bg_remove_with_api: true/false (default false)
+        If true, uses fal-ai/birefnet/v2 for background removal (instead of custom methods).
     """
     start_time = time.time()
     processing_log = []
@@ -1086,9 +1190,18 @@ def remove_bg_endpoint():
             log("read_params", success=False, reason="invalid_bg_remove", received=bg_remove)
             return json_error({"error": "Invalid bg_remove value", "allowed": sorted(list(allowed_bg))}, status=400)
 
-        log("read_params", success=True,
-            enhance=do_enhance, enhance_second=do_enhance_second,
-            trim=do_trim, output_format=output_format, bg_remove=bg_remove
+        # NEW: flag to use BiRefNet API for bg removal
+        bg_remove_with_api = request.form.get("bg_remove_with_api", "false").lower() == "true"
+
+        log(
+            "read_params",
+            success=True,
+            enhance=do_enhance,
+            enhance_second=do_enhance_second,
+            trim=do_trim,
+            output_format=output_format,
+            bg_remove=bg_remove,
+            bg_remove_with_api=bg_remove_with_api,
         )
 
         # already transparent?
@@ -1126,6 +1239,39 @@ def remove_bg_endpoint():
             if bg_remove == "skip":
                 result_img = img.convert("RGBA")
                 method_used = "skip_requested"
+
+            # NEW: Use fal-ai/birefnet/v2 if requested
+            elif bg_remove_with_api:
+                out_bytes, applied, api_msg = remove_bg_birefnet_fal(
+                    img_bytes,
+                    model="General Use (Light)",
+                    operating_resolution="1024x1024",
+                    output_format="png",
+                    refine_foreground=True,
+                    sync_mode=False,
+                )
+
+                log("bg_remove_birefnet_submit", success=True, applied=bool(applied), message=str(api_msg))
+
+                if applied and out_bytes:
+                    result_img = _open_image_bytes(out_bytes).convert("RGBA")
+                    method_used = "fal_birefnet_v2"
+                    meta = {"api": "fal-ai/birefnet/v2", "message": str(api_msg)}
+                else:
+                    # fallback to your existing methods to avoid breaking production
+                    fallback_used = True
+                    if bg_remove == "color":
+                        result_img, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
+                        method_used = "color_v3_forced_fallback"
+                    elif bg_remove == "ai":
+                        result_img, meta = remove_bg_ai_method(img, is_graphic=analysis.get("is_graphic", False))
+                        method_used = "ai_rembg_forced_fallback"
+                    else:
+                        result_img, method_used, fb2, meta = remove_bg_auto_v3(img, analysis)
+                        fallback_used = bool(fallback_used or fb2)
+
+                    meta = dict(meta or {})
+                    meta["api_fallback_reason"] = str(api_msg)
 
             elif bg_remove == "color":
                 result_img, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
@@ -1204,10 +1350,14 @@ def remove_bg_endpoint():
             result_img = soften_alpha_edge(result_img, radius_px=1)
             log("soften_alpha_edge_2", success=True, radius_px=1)
 
-            log("enhance_second", success=True, mode=enhance_second_mode, applied=bool(enhanced_second), message=str(enhance_second_msg),
-                out_size=f"{result_img.width}x{result_img.height}")
-
-
+            log(
+                "enhance_second",
+                success=True,
+                mode=enhance_second_mode,
+                applied=bool(enhanced_second),
+                message=str(enhance_second_msg),
+                out_size=f"{result_img.width}x{result_img.height}",
+            )
 
         # trim
         if do_trim:
@@ -1241,6 +1391,7 @@ def remove_bg_endpoint():
         )
 
         resp.headers["X-Bg-Remove"] = bg_remove
+        resp.headers["X-Bg-Remove-With-Api"] = str(bool(bg_remove_with_api))
         resp.headers["X-Method-Used"] = method_used
         resp.headers["X-Fallback-Used"] = str(bool(fallback_used))
         resp.headers["X-Enhanced"] = str(bool(enhanced))
@@ -1255,9 +1406,11 @@ def remove_bg_endpoint():
 
     except Exception as e:
         import traceback
+
         tb = traceback.format_exc()
         log("exception", success=False, error=str(e))
         return json_error({"error": "Processing failed", "details": str(e), "traceback": tb}, status=500)
+
 
 
 # -----------------------------
