@@ -1728,7 +1728,7 @@ def process_logo():
 @app.route('/smart-print-ready', methods=['POST'])
 def smart_print_ready():
     """
-    SMART PRINT-READY (Hybrid v7)
+    SMART PRINT-READY (Hybrid v7.0)
     - Converts logo to print-ready grayscale (white or black scheme) with transparency preserved.
     - Handles mixed logos: per connected-component decide Gradient vs Stepped Layers.
     - Keeps your “group/layer” behavior for solid regions while avoiding ugly banding for gradients.
