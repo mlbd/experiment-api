@@ -1470,11 +1470,11 @@ def remove_bg_endpoint():
         # result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
         # log("cleanup_edge_spill", success=True, band_px=2, dist_thresh=26, gamma=1.6)
 
-        result_img = _decontaminate_edges(result_img, bg_rgb)
-        log("decontaminate_final", success=True, bg_rgb=bg_rgb)
+        # result_img = _decontaminate_edges(result_img, bg_rgb)
+        # log("decontaminate_final", success=True, bg_rgb=bg_rgb)
 
-        result_img = soften_alpha_edge(result_img, radius_px=1)
-        log("soften_alpha_edge", success=True, radius_px=1)
+        # result_img = soften_alpha_edge(result_img, radius_px=1)
+        # log("soften_alpha_edge", success=True, radius_px=1)
 
         # ✅ enhance_second (skip if high-res at this stage too)
         enhanced_second = False
@@ -1520,11 +1520,11 @@ def remove_bg_endpoint():
             # result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
             # log("cleanup_edge_spill_2", success=True, band_px=2, dist_thresh=26, gamma=1.6)
 
-            result_img = _decontaminate_edges(result_img, bg_rgb)
-            log("decontaminate_final_2", success=True, bg_rgb=bg_rgb)
+            # result_img = _decontaminate_edges(result_img, bg_rgb)
+            # log("decontaminate_final_2", success=True, bg_rgb=bg_rgb)
 
-            result_img = soften_alpha_edge(result_img, radius_px=1)
-            log("soften_alpha_edge_2", success=True, radius_px=1)
+            # result_img = soften_alpha_edge(result_img, radius_px=1)
+            # log("soften_alpha_edge_2", success=True, radius_px=1)
 
             log(
                 "enhance_second",
