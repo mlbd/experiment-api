@@ -1591,6 +1591,87 @@ def remove_bg_endpoint():
         return json_error({"error": "Server error", "message": str(e)}, status=500)
 
 
+# -----------------------------------------
+# /trim-transparent  (NEW endpoint)
+# -----------------------------------------
+@app.route("/trim-transparent", methods=["POST"])
+def trim_transparent_endpoint():
+    """
+    Trim extra transparent whitespace around an image (PNG/WebP with alpha).
+
+    Params (form-data):
+      - image: file (required)
+      - padding: int (optional, default 2)   # pixels to keep around content
+      - output_format: png | webp (optional, default png)
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+
+    enforce_error = _enforce_only_image_field()
+    if enforce_error:
+        return enforce_error
+
+    if "image" not in request.files:
+        return jsonify({"error": "Missing image file"}), 400
+
+    file = request.files["image"]
+    img_bytes = file.read() or b""
+    if not img_bytes:
+        return jsonify({"error": "Empty image file"}), 400
+
+    # Params
+    try:
+        padding = int(request.form.get("padding", 2))
+    except Exception:
+        padding = 2
+    padding = max(0, min(padding, 200))  # safety clamp
+
+    output_format = (request.form.get("output_format", "png") or "png").strip().lower()
+    if output_format not in ("png", "webp"):
+        output_format = "png"
+
+    # Decode + trim
+    try:
+        img = _open_image_bytes(img_bytes).convert("RGBA")
+    except Exception:
+        return jsonify({"error": "Invalid image"}), 400
+
+    before_w, before_h = img.size
+
+    try:
+        trimmed = trim_transparent(img, padding=padding)
+        if not isinstance(trimmed, Image.Image):
+            trimmed = img
+    except Exception as e:
+        return jsonify({"error": "Trim failed", "message": str(e)}), 500
+
+    after_w, after_h = trimmed.size
+
+    # Encode
+    out = BytesIO()
+    if output_format == "webp":
+        trimmed.save(out, format="WEBP", lossless=True, quality=100, method=6)
+        mimetype = "image/webp"
+        ext = "webp"
+    else:
+        trimmed.save(out, format="PNG", optimize=True)
+        mimetype = "image/png"
+        ext = "png"
+
+    out.seek(0)
+
+    resp = send_file(
+        out,
+        mimetype=mimetype,
+        as_attachment=False,
+        download_name=f"trimmed.{ext}",
+    )
+    resp.headers["X-Trim-Padding"] = str(padding)
+    resp.headers["X-Size-Before"] = f"{before_w}x{before_h}"
+    resp.headers["X-Size-After"] = f"{after_w}x{after_h}"
+    resp.headers["X-Trim-Changed"] = str((before_w, before_h) != (after_w, after_h)).lower()
+    return resp
 
 
 # -----------------------------
