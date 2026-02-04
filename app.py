@@ -56,7 +56,7 @@ REMBG_SESSION = None
 # -----------------------------
 # RESOLUTION / UPSCALE GUARD
 # -----------------------------
-HIGH_RES_THRESHOLD = int(os.environ.get("HIGH_RES_THRESHOLD", 1600))
+HIGH_RES_THRESHOLD = int(os.environ.get("HIGH_RES_THRESHOLD", 800))
 
 # -----------------------------
 # AUTH / VALIDATION
@@ -1229,6 +1229,9 @@ def remove_bg_rembg_api(
 # -----------------------------
 # /remove-bg (ONLY endpoint)
 # -----------------------------
+# -----------------------------
+# /remove-bg (ONLY endpoint)
+# -----------------------------
 @app.route("/remove-bg", methods=["POST"])
 def remove_bg_endpoint():
     """
@@ -1248,7 +1251,7 @@ def remove_bg_endpoint():
       - enhance_second_mode: fal | skip_fal | local (default fal)
 
     High-res rule:
-      If is_high_resolution_pil(img) == True (threshold 1200), skip enhance/upscale steps.
+      If is_high_resolution_pil(img) == True (threshold HIGH_RES_THRESHOLD), skip enhance/upscale steps.
     Output cap:
       Always downscale output to max 1000px longest side (never upscale).
     """
@@ -1342,6 +1345,51 @@ def remove_bg_endpoint():
             already_transparent = False
             log("check_transparency", success=False, error=str(e), already_transparent=False)
 
+        # ✅ If input already has transparency: skip pipeline, only TRIM transparent whitespace and return.
+        if already_transparent:
+            try:
+                img0 = _open_image_bytes(img_bytes).convert("RGBA")
+                log("decode_image_early", success=True, mode=img0.mode, size=f"{img0.width}x{img0.height}")
+            except Exception as e:
+                log("decode_image_early", success=False, error=str(e))
+                return json_error({"error": "Invalid image"}, status=400)
+
+            img0 = trim_transparent(img0, padding=2)
+            log("trim_early", success=True, out_size=f"{img0.width}x{img0.height}")
+
+            # keep output cap (never upscale)
+            img0, resize_meta = downscale_max_side(img0, max_side=1000)
+            log("output_resize_cap_early", success=True, **resize_meta)
+
+            out = BytesIO()
+            if output_format == "webp":
+                img0.save(out, format="WEBP", lossless=True, quality=100, method=6)
+                mimetype = "image/webp"
+                ext = "webp"
+            else:
+                img0.save(out, format="PNG", optimize=True)
+                mimetype = "image/png"
+                ext = "png"
+
+            out.seek(0)
+            log("encode_early", success=True, format=ext, out_bytes=out.getbuffer().nbytes)
+
+            processing_time = time.time() - start_time
+            log("done_early", success=True, processing_time_s=f"{processing_time:.2f}")
+
+            resp = send_file(
+                out,
+                mimetype=mimetype,
+                as_attachment=False,
+                download_name=f"removed_bg.{ext}",
+            )
+            resp.headers["X-RemoveBG-Method"] = "skip_already_transparent_trimmed"
+            resp.headers["X-Trimmed"] = "true"
+            resp.headers["X-Output-Size"] = f"{img0.width}x{img0.height}"
+            resp.headers["X-Processing-Time"] = f"{processing_time:.2f}s"
+            resp.headers["X-Output-Resize-Cap"] = "1000"
+            return attach_logs_to_response(resp)
+
         # resolution check (before any optional fal enhance)
         try:
             pre_img = _open_image_bytes(img_bytes)
@@ -1358,7 +1406,7 @@ def remove_bg_endpoint():
             is_high_res = False
             log("resolution_check", success=False, error=str(e), threshold=int(HIGH_RES_THRESHOLD), is_high_resolution=False)
 
-        # optional enhance (skip if already high-res)
+        # optional enhance (✅ skip if already high-res)
         enhanced = False
         enhance_msg = "not requested"
         if do_enhance:
@@ -1372,6 +1420,21 @@ def remove_bg_endpoint():
                     img_bytes = enhanced_bytes
                 log("enhance_fal", success=True, applied=bool(enhanced), message=str(enhance_msg))
 
+                # If fal changed size, refresh high-res status for later stages
+                try:
+                    post_enh_img = _open_image_bytes(img_bytes)
+                    is_high_res = is_high_resolution_pil(post_enh_img, threshold=HIGH_RES_THRESHOLD)
+                    log(
+                        "resolution_check_post_enhance",
+                        success=True,
+                        width=post_enh_img.width,
+                        height=post_enh_img.height,
+                        threshold=int(HIGH_RES_THRESHOLD),
+                        is_high_resolution=bool(is_high_res),
+                    )
+                except Exception as e:
+                    log("resolution_check_post_enhance", success=False, error=str(e))
+
         # decode
         img = _open_image_bytes(img_bytes)
         log("decode_image", success=True, mode=img.mode, size=f"{img.width}x{img.height}")
@@ -1383,60 +1446,56 @@ def remove_bg_endpoint():
         fallback_used = False
         meta = {}
 
-        if already_transparent:
+        if bg_remove == "skip":
             result_img = img.convert("RGBA")
-            method_used = "skip_already_transparent"
-        else:
-            if bg_remove == "skip":
-                result_img = img.convert("RGBA")
-                method_used = "skip_requested"
+            method_used = "skip_requested"
 
-            elif bg_remove_with_api:
-                # Use rembg.com API
-                out_bytes, applied, api_msg = remove_bg_rembg_api(
-                    img_bytes,
-                    out_format="png",   # keep PNG for transparent pipeline
-                    w=None,
-                    h=None,
-                    exact_resize=False,
-                    mask=False,
-                    bg_color=None,
-                    angle=0,
-                    expand=True,
-                    timeout=120
-                )
-                log("bg_remove_rembg_api", success=True, applied=bool(applied), message=str(api_msg))
+        elif bg_remove_with_api:
+            # Use rembg.com API
+            out_bytes, applied, api_msg = remove_bg_rembg_api(
+                img_bytes,
+                out_format="png",
+                w=None,
+                h=None,
+                exact_resize=False,
+                mask=False,
+                bg_color=None,
+                angle=0,
+                expand=True,
+                timeout=120
+            )
+            log("bg_remove_rembg_api", success=True, applied=bool(applied), message=str(api_msg))
 
-                if applied and out_bytes:
-                    result_img = _open_image_bytes(out_bytes).convert("RGBA")
-                    method_used = "rembg_api"
-                    meta = {"api": "api.rembg.com/rmbg", "message": str(api_msg)}
-                else:
-                    # fallback to existing methods (production safe)
-                    fallback_used = True
-                    if bg_remove == "color":
-                        result_img, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
-                        method_used = "color_v3_forced_fallback"
-                    elif bg_remove == "ai":
-                        result_img, meta = remove_bg_ai_method(img, is_graphic=analysis.get("is_graphic", False))
-                        method_used = "ai_rembg_forced_fallback"
-                    else:
-                        result_img, method_used, fb2, meta = remove_bg_auto_v3(img, analysis)
-                        fallback_used = bool(fallback_used or fb2)
-
-                    meta = dict(meta or {})
-                    meta["api_fallback_reason"] = str(api_msg)
-
-            elif bg_remove == "color":
-                result_img, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
-                method_used = "color_v3_forced"
-
-            elif bg_remove == "ai":
-                result_img, meta = remove_bg_ai_method(img, is_graphic=analysis.get("is_graphic", False))
-                method_used = "ai_rembg_forced"
-
+            if applied and out_bytes:
+                result_img = _open_image_bytes(out_bytes).convert("RGBA")
+                method_used = "rembg_api"
+                meta = {"api": "api.rembg.com/rmbg", "message": str(api_msg)}
             else:
-                result_img, method_used, fallback_used, meta = remove_bg_auto_v3(img, analysis)
+                # fallback to existing methods (production safe)
+                fallback_used = True
+                if bg_remove == "color":
+                    result_img, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
+                    method_used = "color_v3_forced_fallback"
+                elif bg_remove == "ai":
+                    result_img, meta = remove_bg_ai_method(img, is_graphic=analysis.get("is_graphic", False))
+                    method_used = "ai_rembg_forced_fallback"
+                else:
+                    result_img, method_used, fb2, meta = remove_bg_auto_v3(img, analysis)
+                    fallback_used = bool(fallback_used or fb2)
+
+                meta = dict(meta or {})
+                meta["api_fallback_reason"] = str(api_msg)
+
+        elif bg_remove == "color":
+            result_img, meta = remove_bg_color_method_v3(img, bg_color=analysis.get("bg_color"), tolerance=16)
+            method_used = "color_v3_forced"
+
+        elif bg_remove == "ai":
+            result_img, meta = remove_bg_ai_method(img, is_graphic=analysis.get("is_graphic", False))
+            method_used = "ai_rembg_forced"
+
+        else:
+            result_img, method_used, fallback_used, meta = remove_bg_auto_v3(img, analysis)
 
         log("bg_removed", success=True, method_used=method_used, fallback_used=fallback_used, meta=meta)
 
@@ -1449,27 +1508,35 @@ def remove_bg_endpoint():
             result_img = sharpen_rgb_keep_alpha(result_img, amount=1.10, radius=1.2, threshold=3)
             log("sharpen", success=True, amount=1.10, radius=1.2, threshold=3)
 
-        # 1) edge spill cleanup (alpha fix near transparency only)
+        # edge cleanup/decontaminate
         bg_rgb = analysis.get("bg_color") or (255, 255, 255)
         result_img = cleanup_edge_spill(result_img, bg_rgb=bg_rgb, band_px=2, dist_thresh=26, gamma=1.6)
         log("cleanup_edge_spill", success=True, band_px=2, dist_thresh=26, gamma=1.6)
 
-        # 2) then decontaminate (RGB fix)
         result_img = _decontaminate_edges(result_img, bg_rgb)
         log("decontaminate_final", success=True, bg_rgb=bg_rgb)
 
-        # 3) optional tiny alpha smoothing
         result_img = soften_alpha_edge(result_img, radius_px=1)
         log("soften_alpha_edge", success=True, radius_px=1)
 
+        # ✅ enhance_second (skip if high-res at this stage too)
         enhanced_second = False
         enhance_second_msg = "not requested"
 
         if do_enhance_second:
             before_second = result_img.convert("RGBA")
 
-            # Skip ANY upscaling/enhancing if already high-res
-            if is_high_res:
+            is_high_res_second = is_high_resolution_pil(before_second, threshold=HIGH_RES_THRESHOLD)
+            log(
+                "resolution_check_second",
+                success=True,
+                width=before_second.width,
+                height=before_second.height,
+                threshold=int(HIGH_RES_THRESHOLD),
+                is_high_resolution=bool(is_high_res_second),
+            )
+
+            if is_high_res_second:
                 enhanced_second = False
                 enhance_second_msg = f"skipped_high_res:{int(HIGH_RES_THRESHOLD)}px"
                 enh_img = before_second
@@ -1488,11 +1555,7 @@ def remove_bg_endpoint():
                 else:
                     tmp_bytes = pil_to_png_bytes(before_second)
                     second_bytes, enhanced_second, enhance_second_msg = enhance_image_fal(tmp_bytes)
-
-                    if enhanced_second and second_bytes:
-                        enh_img = _open_image_bytes(second_bytes)
-                    else:
-                        enh_img = before_second
+                    enh_img = _open_image_bytes(second_bytes) if (enhanced_second and second_bytes) else before_second
 
             result_img = restore_alpha_if_missing(enh_img, before_second)
 
@@ -1562,22 +1625,18 @@ def remove_bg_endpoint():
         resp.headers["X-Processing-Time"] = f"{processing_time:.2f}s"
         resp.headers["X-Output-Size"] = f"{result_img.width}x{result_img.height}"
 
-        # resolution guard debug
         resp.headers["X-High-Resolution"] = str(bool(is_high_res))
         resp.headers["X-High-Resolution-Threshold"] = str(int(HIGH_RES_THRESHOLD))
         resp.headers["X-Output-Resize-Cap"] = "1000"
 
-        # API marker
         if bg_remove_with_api:
             resp.headers["X-BgRemove-Api"] = "api.rembg.com/rmbg"
 
         return attach_logs_to_response(resp)
 
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
         log("exception", success=False, error=str(e))
-        return json_error({"error": "Processing failed", "details": str(e), "traceback": tb}, status=500)
+        return json_error({"error": "Server error", "message": str(e)}, status=500)
 
 
 
