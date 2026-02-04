@@ -1673,6 +1673,84 @@ def trim_transparent_endpoint():
     resp.headers["X-Trim-Changed"] = str((before_w, before_h) != (after_w, after_h)).lower()
     return resp
 
+# -----------------------------------------
+# /remove-bg-api  (NEW endpoint)
+# -----------------------------------------
+@app.route("/remove-bg-api", methods=["POST"])
+def remove_bg_api_endpoint():
+    """
+    Remove background using ONLY remove_bg_rembg_api (no other pipeline).
+
+    Params (form-data):
+      - image: file (required)
+      - output_format: png | webp (optional, default png)   # response format
+      - timeout: int seconds (optional, default 120)
+
+    Notes:
+      - Uses your existing helper: remove_bg_rembg_api(...)
+      - Returns 502 if the API fails / returns no output
+    """
+    auth_error = verify_api_key()
+    if auth_error:
+        return auth_error
+
+    enforce_error = _enforce_only_image_field()
+    if enforce_error:
+        return enforce_error
+
+    if "image" not in request.files:
+        return jsonify({"error": "Missing image file"}), 400
+
+    file = request.files["image"]
+    img_bytes = file.read() or b""
+    if not img_bytes:
+        return jsonify({"error": "Empty image file"}), 400
+
+    output_format = (request.form.get("output_format", "png") or "png").strip().lower()
+    if output_format not in ("png", "webp"):
+        output_format = "png"
+
+    try:
+        timeout = int(request.form.get("timeout", 120))
+    except Exception:
+        timeout = 120
+    timeout = max(10, min(timeout, 600))
+
+    # Call your API wrapper (no extra processing)
+    out_bytes, applied, msg = remove_bg_rembg_api(
+        img_bytes,
+        out_format=output_format,  # your helper should support png/webp; if not, set "png" here always
+        w=None,
+        h=None,
+        exact_resize=False,
+        mask=False,
+        bg_color=None,
+        angle=0,
+        expand=True,
+        timeout=timeout,
+    )
+
+    if not applied or not out_bytes:
+        return jsonify({
+            "error": "Background removal failed",
+            "message": str(msg) if msg else "Unknown error",
+        }), 502
+
+    # Ensure output is valid image bytes; if your helper already returns final bytes, just send them
+    mimetype = "image/webp" if output_format == "webp" else "image/png"
+    download_name = f"no_bg.{ 'webp' if output_format == 'webp' else 'png' }"
+
+    resp = send_file(
+        BytesIO(out_bytes),
+        mimetype=mimetype,
+        as_attachment=False,
+        download_name=download_name,
+    )
+    resp.headers["X-RemoveBG-Method"] = "rembg_api_only"
+    resp.headers["X-RemoveBG-Api"] = "api.rembg.com/rmbg"
+    resp.headers["X-RemoveBG-Message"] = (str(msg)[:200] if msg else "ok")
+    return resp
+
 
 # -----------------------------
 # /process-logo endpoint
